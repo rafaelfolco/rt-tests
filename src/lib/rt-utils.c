@@ -409,8 +409,7 @@ static void open_tracemark_fd(void)
 	 */
 	if (tracemark_fd < 0) {
 		sprintf(path, "%s/%s", fileprefix, "trace_marker");
-		tracemark_fd = open(path, O_WRONLY);
-		if (tracemark_fd < 0) {
+		if ((tracemark_fd = open(path, O_WRONLY)) < 0) {
 			warn("unable to open trace_marker file: %s\n", path);
 			return;
 		}
@@ -458,25 +457,85 @@ static void debugfs_prepare(void)
 		     "debug fs not mounted");
 }
 
+void tracing_on(void)
+{
+	ssize_t bytes_written;
+
+	if (trace_fd < 0) {
+		warn("tracing_on(): File descriptors not ready\n");
+		return;
+	}
+
+	/* start tracing */
+	bytes_written = write(trace_fd, "1\n", 2);
+	if (bytes_written == -1)
+		warn("tracing_on(): Failed to start tracing (%s)\n", strerror(errno));
+}
+
+void tracing_off(void)
+{
+	ssize_t bytes_written;
+
+	if (trace_fd < 0) {
+		warn("tracing_off(): File descriptors not ready\n");
+		return;
+	}
+
+	/* stop tracing */
+	bytes_written = write(trace_fd, "0\n", 2);
+	if (bytes_written == -1)
+		warn("tracing_off(): Failed to stop tracing (%s)\n", strerror(errno));
+}
+
 void tracemark(char *fmt, ...)
 {
 	va_list ap;
 	int len;
+	ssize_t bytes_written;
 
 	/* bail out if we're not tracing */
 	/* or if the kernel doesn't support trace_mark */
-	if (tracemark_fd < 0 || trace_fd < 0)
+	if (tracemark_fd < 0 || trace_fd < 0) {
+		warn("tracemark(): File descriptors not ready\n");
 		return;
+	}
 
 	va_start(ap, fmt);
 	len = vsnprintf(tracebuf, TRACEBUFSIZ, fmt, ap);
 	va_end(ap);
 
 	/* write the tracemark message */
-	write(tracemark_fd, tracebuf, len);
+	bytes_written = write(tracemark_fd, tracebuf, len);
+	if (bytes_written == -1)
+		warn("tracemark(): Failed to write tracemark (%s) (%s)\n", tracebuf, strerror(errno));
+}
 
-	/* now stop any trace */
-	write(trace_fd, "0\n", 2);
+void tracemark_break(char *fmt, ...)
+{
+	va_list ap;
+	int len;
+	ssize_t bytes_written;
+
+	/* bail out if we're not tracing */
+	/* or if the kernel doesn't support trace_mark */
+	if (tracemark_fd < 0 || trace_fd < 0) {
+		warn("tracemark_break(): File descriptors not ready\n");
+		return;
+	}
+
+	va_start(ap, fmt);
+	len = vsnprintf(tracebuf, TRACEBUFSIZ, fmt, ap);
+	va_end(ap);
+
+	/* write the tracemark message */
+	bytes_written = write(tracemark_fd, tracebuf, len);
+	if (bytes_written == -1)
+		warn("tracemark_break(): Failed to write tracemark (%s) (%s)\n", tracebuf, strerror(errno));
+
+	/* stop tracing */
+	bytes_written = write(trace_fd, "0\n", 2);
+	if (bytes_written == -1)
+		warn("tracemark_break(): Failed to stop tracing (%s)\n", strerror(errno));
 }
 
 void enable_trace_mark(void)

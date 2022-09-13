@@ -120,6 +120,7 @@ struct workload {
 
 struct thread {
 	int                  core_i;
+    int                  last;
 	pthread_t            thread_id;
 
 	/* NOTE! this is also how many ticks per us */
@@ -172,6 +173,9 @@ struct global {
 	int                   enable_bias;
 	uint64_t              bias;
 	int                   quiet;
+	int                   trace_control;
+	int                   trace_markers;
+	int                   measurement;
 	int                   single_preheat_thread;
 	int                   output_omit_zero_buckets;
 	char                  jsonfile[MAX_PATH];
@@ -184,6 +188,39 @@ struct global {
 };
 
 static struct global g;
+
+/*
+ * vmstat_update trick
+ */
+static void poke_vmstat_refresh(void)
+{
+	struct stat s;
+	int err;
+	int stat_refresh_fd = -1;
+	int num = 1;
+
+	errno = 0;
+	err = stat("/proc/sys/vm/stat_refresh", &s);
+	if (err == -1) {
+		err_msg_n(errno, "WARN: stat /proc/sys/vm/stat_refresh failed");
+		return;
+	}
+
+	errno = 0;
+	stat_refresh_fd = open("/proc/sys/vm/stat_refresh", O_RDWR);
+	if (stat_refresh_fd == -1) {
+		err_msg_n(errno, "WARN: open ");
+		return;
+	}
+
+	errno = 0;
+	err = write(stat_refresh_fd, &num, 1);
+	if (err < 1)
+		err_msg_n(errno, "# error poking vmstat_refresh!");
+
+	close(stat_refresh_fd);
+	printf("# vmstat_refresh poked\n");
+}
 
 static void workload_nop(char *dst, char *src, size_t size)
 {
@@ -303,7 +340,7 @@ static void insert_bucket(struct thread *t, stamp_t value)
 	if (g.trace_threshold && us >= g.trace_threshold) {
 		char *line = "%s: Trace threshold (%d us) triggered with %u us!\n"
 		    "Stopping the test.\n";
-		tracemark(line, g.app_name, g.trace_threshold, us);
+		tracemark_break(line, g.app_name, g.trace_threshold, us);
 		err_quit(line, g.app_name, g.trace_threshold, us);
 	}
 
@@ -352,7 +389,12 @@ static void doit(struct thread *t)
 {
 	stamp_t ts1, ts2;
 	workload_fn workload_fn = g.workload->w_fn;
+	char *start_line = "%s: CPU %d: Starting critical section";
+	char *stop_line = "%s: CPU %d: Stopping critical section";
 
+	if (g.measurement && g.trace_markers) {
+		tracemark(start_line, g.app_name, t->core_i);
+	}
 	frc(&ts2);
 	do {
 		workload_fn(t->dst_buf, t->src_buf, g.workload_mem_size);
@@ -360,6 +402,9 @@ static void doit(struct thread *t)
 		insert_bucket(t, ts1 - ts2);
 		ts2 = ts1;
 	} while (g.cmd == GO);
+	if (g.measurement && g.trace_markers) {
+		tracemark(stop_line, g.app_name, t->core_i);
+	}
 }
 
 static int set_fifo_prio(int prio)
@@ -394,10 +439,16 @@ static void *thread_main(void *arg)
 
 	thread_init(t);
 
+	if (t->last) {
+		printf("# last thread (core=%d)\n", t->core_i);
+		poke_vmstat_refresh();
+		sleep(3);
+	}
+
 	/* Ensure we all start at the same time. */
 	atomic_inc(&g.n_threads_running);
 	while (g.n_threads_running != g.n_threads)
-		relax();
+		usleep(1000);
 
 	frc(&t->frc_start);
 	doit(t);
@@ -533,6 +584,10 @@ static void run_expt(struct thread *threads, int runtime_secs)
 		usleep(1000);
 
 	gettimeofday(&g.tv_start, NULL);
+	if (g.measurement && g.trace_control) {
+		printf("Starting tracing\n");
+		tracing_on();
+	}
 	g.cmd = GO;
 
 	alarm(runtime_secs);
@@ -540,6 +595,11 @@ static void run_expt(struct thread *threads, int runtime_secs)
 	/* Go to sleep until the threads have done their stuff. */
 	for (i = 0; i < g.n_threads; ++i)
 		pthread_join(threads[i].thread_id, NULL);
+
+	if (g.measurement && g.trace_control) {
+		printf("Stopping tracing\n");
+		tracing_off();
+	}
 }
 
 static void handle_alarm(int code)
@@ -573,6 +633,9 @@ static void usage(int error)
 	       "                       to lock the freq then please don't use this parameter.\n"
 	       "-T, --trace-threshold  Stop the test when threshold triggered (in us),\n"
 	       "                       print a marker in ftrace and stop ftrace too.\n"
+	       "    --trace-control    Start and stop ftrace before and after the measurement.\n"
+	       "    --trace-markers    Write per thread trace markers around the measurement critical\n"
+	       "                       section.\n"
 	       "-v, --version          Display the version of the software.\n"
 	       "-w, --workload         Specify a kind of workload, default is no workload\n"
 	       "                       (options: no, memmove)\n"
@@ -600,7 +663,7 @@ enum option_value {
 	OPT_DURATION, OPT_JSON, OPT_RT_PRIO, OPT_HELP, OPT_TRACE_TH,
 	OPT_WORKLOAD, OPT_WORKLOAD_MEM, OPT_BIAS,
 	OPT_QUIET, OPT_SINGLE_PREHEAT, OPT_ZERO_OMIT,
-	OPT_VERSION
+	OPT_VERSION, OPT_TRACE_CONTROL, OPT_TRACE_MARKERS
 };
 
 /* Process commandline options */
@@ -617,6 +680,8 @@ static void parse_options(int argc, char *argv[])
 			{ "rtprio",	required_argument,	NULL, OPT_RT_PRIO },
 			{ "help",	no_argument,		NULL, OPT_HELP },
 			{ "trace-threshold", required_argument,	NULL, OPT_TRACE_TH },
+			{ "trace-control", no_argument,         NULL, OPT_TRACE_CONTROL },
+			{ "trace-markers", no_argument,         NULL, OPT_TRACE_MARKERS },
 			{ "workload",	required_argument,	NULL, OPT_WORKLOAD },
 			{ "workload-mem", required_argument,	NULL, OPT_WORKLOAD_MEM },
 			{ "bias",	no_argument,		NULL, OPT_BIAS },
@@ -687,6 +752,16 @@ static void parse_options(int argc, char *argv[])
 				printf("Parameter --trace-threshold needs to be positive\n");
 				exit(1);
 			}
+			enable_trace_mark();
+			break;
+		case OPT_TRACE_CONTROL:
+			printf("Enabling trace control\n");
+			g.trace_control = 1;
+			enable_trace_mark();
+			break;
+		case OPT_TRACE_MARKERS:
+			printf("Enabling trace markers\n");
+			g.trace_markers = 1;
 			enable_trace_mark();
 			break;
 		case OPT_WORKLOAD:
@@ -783,6 +858,7 @@ static void record_bias(struct thread *t)
 int main(int argc, char *argv[])
 {
 	struct thread *threads;
+	struct timeval tvs, tve;
 	int i, n_cores;
 	struct bitmask *cpu_set = NULL;
 
@@ -800,6 +876,9 @@ int main(int argc, char *argv[])
 
 	g.app_name = argv[0];
 	g.rtprio = 0;
+	g.trace_control = 0;
+	g.trace_markers = 0;
+	g.measurement = 0;
 	g.bucket_size = BUCKET_SIZE;
 	g.runtime = 1;
 	g.workload = &workload_list[WORKLOAD_DEFAULT];
@@ -823,9 +902,11 @@ int main(int argc, char *argv[])
 	for (i = 0; n_cores && i < cpu_set->size; i++) {
 		if (numa_bitmask_isbitset(cpu_set, i) && move_to_core(i) == 0) {
 			threads[g.n_threads_total++].core_i = i;
+            threads[g.n_threads_total - 1].last = 0;
 			n_cores--;
 		}
 	}
+    threads[g.n_threads_total - 1].last = 1;
 
 	if (numa_bitmask_isbitset(cpu_set, 0) && g.rtprio)
 		printf("WARNING: Running SCHED_FIFO workload on CPU 0 may hang the thread\n");
@@ -850,15 +931,19 @@ int main(int argc, char *argv[])
 	run_expt(threads, 1);
 	record_bias(threads);
 
+	gettimeofday(&tvs, NULL);
 	if (!g.quiet)
-		printf("Test starts...\n");
+		printf("Test started at %f\n", tvs.tv_sec + tvs.tv_usec / 1e6);
+
 	/* Reset n_threads to always run on all the cores */
 	g.n_threads = g.n_threads_total;
+	g.measurement = 1;
 	rt_test_start();
 	run_expt(threads, g.runtime);
 
+	gettimeofday(&tve, NULL);
 	if (!g.quiet)
-		printf("Test completed.\n\n");
+		printf("Test completed at %f\n\n", tve.tv_sec + tve.tv_usec / 1e6);
 
 	write_summary(threads);
 
